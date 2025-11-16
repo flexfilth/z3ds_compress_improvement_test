@@ -34,15 +34,6 @@ MSYS/MinGW or external batch wrappers. Set `Z3DS_USE_SYSTEM_ZSTD=ON` if you pref
 Linux. The GUI target is Windows-only; on other platforms `Z3DS_ENABLE_GUI` is disabled automatically, but the CLI still
 builds normally.
 
-### Ready-to-use Windows builds
-
-Distributable `.exe` files live under [`dist/windows`](dist/windows). The CI environment for this change cannot download
-or install a Windows-capable toolchain (the corporate proxy rejects both `apt` and HTTPS downloads), so the folder only
-contains instructions at the moment. Once a Windows build host runs the Visual Studio preset above, copy
-`z3ds_compressor.exe`, `z3ds_gui.exe`, and any required DLLs into `dist/windows/` and commit them so other testers can
-download the ready-to-run executables without touching batch files.
-
-## GUI Overview (Windows)
 
 `z3ds_gui.exe` is a lightweight Win32 front-end that reuses the same compression engine as the CLI:
 
@@ -113,11 +104,3 @@ z3ds_compressor packed.zcci original.cci --decompress
 When no output filename is provided, the tool automatically swaps the `.zcia`/`.zcci`/`.zcxi`/`.z3dsx` extension back to
 its original counterpart.
 
-## Tips
-
-* Use `--fast` or smaller frame sizes when you want a quick archival pass; switch to `--level 19` plus 8 MiB frames for
-  maximum space savings.
-* CIA files that already contain compressed/encrypted data may not shrink much; batch mode will still skip deleting the
-  originals unless `--delete-source` is specified.
-* The GUI and CLI share the same backend, so you can prototype a configuration in one interface and replicate it in the
-  other with identical results.
