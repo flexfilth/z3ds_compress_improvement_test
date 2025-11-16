@@ -5,6 +5,5 @@ format that Azahar and other emulators can open directly. A Windows-native GUI i
 point-and-click workflow instead of the command line.
 
 It can also restore `.zcia`, `.zcci`, `.zcxi`, and `.z3dsx` containers back to their original ROM formats, matching the
-workflow described in [Azahar PR #1208](https://github.com/azahar-emu/azahar/pull/1208).
-
+workflow described in [Azahar PR #1208](https://github.com/azahar-emu/azahar/pull/1208)
 
