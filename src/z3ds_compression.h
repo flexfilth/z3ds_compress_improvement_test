@@ -1,12 +1,12 @@
 #pragma once
 
 #include <array>
-#include <vector>
-#include <string>
-#include <functional>
-#include <unordered_map>
 #include <cstdint>
-#include <span>
+#include <functional>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
 
 using u8 = uint8_t;
 using u16 = uint16_t;
@@ -62,9 +62,16 @@ using ProgressCallback = std::function<void(std::size_t, std::size_t)>;
 bool CompressZ3DSFile(const std::string& src_file, const std::string& dst_file,
                       const std::array<u8, 4>& underlying_magic, size_t frame_size,
                       ProgressCallback update_callback = nullptr,
-                      const std::unordered_map<std::string, std::vector<u8>>& metadata = {});
+                      const std::unordered_map<std::string, std::vector<u8>>& metadata = {},
+                      int compression_level = 15,
+                      unsigned int worker_count = 1,
+                      size_t read_chunk_size = 1024 * 1024);
+
+bool DecompressZ3DSFile(const std::string& src_file, const std::string& dst_file,
+                        ProgressCallback update_callback = nullptr,
+                        size_t read_chunk_size = 1024 * 1024);
 
 // Utility functions
 std::array<u8, 4> DetectFileMagic(const std::string& filename);
-size_t GetDefaultFrameSize(const std::array<u8, 4>& magic);
+size_t GetDefaultFrameSize(const std::array<u8, 4>& magic, std::string_view extension);
 std::string GetCurrentTimeISO();
