@@ -309,8 +309,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     while (!done)
     {
         MSG msg;
-        while (PeekMessage(&msg, NULL, 0U, 0U, PM_REMOVE))
-        {
+        while (PeekMessage(&msg, NULL, 0U, 0U, PM_REMOVE)) {
             TranslateMessage(&msg);
             DispatchMessage(&msg);
             if (msg.message == WM_QUIT) done = true;
