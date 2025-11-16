@@ -1,11 +1,13 @@
 #include "z3ds_compression.h"
-#include <fstream>
-#include <iostream>
-#include <chrono>
-#include <iomanip>
-#include <sstream>
 #include <algorithm>
+#include <chrono>
+#include <cctype>
 #include <cstring>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <optional>
+#include <sstream>
 #include <zstd.h>
 
 // XXH64 implementation to match ZSTD seekable format specification
@@ -197,12 +199,65 @@ std::array<u8, 4> DetectFileMagic(const std::string& filename) {
     return {'U', 'N', 'K', 'N'};
 }
 
-size_t GetDefaultFrameSize(const std::array<u8, 4>& magic) {
-    // CIA and CCI files use larger frame size (32MB), others use 1MB
-    if (magic == std::array<u8, 4>{'N', 'C', 'S', 'D'}) {
-        return 32 * 1024 * 1024; // 32MB for CIA/CCI
+namespace {
+
+u16 ReadLE16(const u8* data) {
+    return static_cast<u16>(data[0] | (static_cast<u16>(data[1]) << 8));
+}
+
+u32 ReadLE32(const u8* data) {
+    return static_cast<u32>(data[0]) |
+           (static_cast<u32>(data[1]) << 8) |
+           (static_cast<u32>(data[2]) << 16) |
+           (static_cast<u32>(data[3]) << 24);
+}
+
+u64 ReadLE64(const u8* data) {
+    u64 value = 0;
+    for (int i = 0; i < 8; ++i) {
+        value |= static_cast<u64>(data[i]) << (i * 8);
     }
-    return 1024 * 1024; // 1MB for CXI and 3DSX
+    return value;
+}
+
+bool ReadHeader(std::ifstream& input, Z3DSFileHeader& header) {
+    std::array<u8, sizeof(Z3DSFileHeader)> raw{};
+    input.seekg(0, std::ios::beg);
+    input.read(reinterpret_cast<char*>(raw.data()), raw.size());
+    if (input.gcount() != static_cast<std::streamsize>(raw.size())) {
+        return false;
+    }
+
+    std::copy(raw.begin(), raw.begin() + 4, header.magic.begin());
+    std::copy(raw.begin() + 4, raw.begin() + 8, header.underlying_magic.begin());
+    header.version = raw[8];
+    header.reserved = raw[9];
+    header.header_size = ReadLE16(raw.data() + 10);
+    header.metadata_size = ReadLE32(raw.data() + 12);
+    header.compressed_size = ReadLE64(raw.data() + 16);
+    header.uncompressed_size = ReadLE64(raw.data() + 24);
+    return true;
+}
+
+} // namespace
+
+size_t GetDefaultFrameSize(const std::array<u8, 4>& magic, std::string_view extension) {
+    std::string ext_lower(extension);
+    std::transform(ext_lower.begin(), ext_lower.end(), ext_lower.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+
+    if (ext_lower == ".cia") {
+        return 32ULL * 1024 * 1024; // Per Azahar recommendation
+    }
+
+    if (magic == std::array<u8, 4>{'N', 'C', 'C', 'H'} ||
+        magic == std::array<u8, 4>{'N', 'C', 'S', 'D'} ||
+        ext_lower == ".cci" || ext_lower == ".cxi" || ext_lower == ".3dsx") {
+        return 256ULL * 1024; // 256KB default for these formats
+    }
+
+    return 1024ULL * 1024; // Fallback 1MB
 }
 
 std::string GetCurrentTimeISO() {
@@ -232,14 +287,23 @@ private:
     u64 total_compressed;
     std::vector<SeekEntry> seek_entries;
     bool use_checksums;
-    
+    int compression_level;
+
 public:
-    SeekableZSTDCompressor(std::ofstream& out, size_t frame_sz, bool checksums = true) 
-        : output(out), frame_size(frame_sz), current_frame_pos(0), total_compressed(0), use_checksums(checksums) {
+    SeekableZSTDCompressor(std::ofstream& out, size_t frame_sz, bool checksums,
+                           int level, unsigned int worker_count)
+        : output(out), frame_size(frame_sz), current_frame_pos(0), total_compressed(0),
+          seek_entries(), use_checksums(checksums), compression_level(level) {
         cctx = ZSTD_createCCtx();
         frame_buffer.reserve(frame_size);
-        // Set compression level to fast for better performance
-        ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, 3);
+        if (cctx) {
+            ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, compression_level);
+            if (worker_count > 1) {
+                ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, worker_count);
+                // Allow overlapping to keep throughput high when multi-threading
+                ZSTD_CCtx_setParameter(cctx, ZSTD_c_overlapLog, 3);
+            }
+        }
     }
     
     ~SeekableZSTDCompressor() {
@@ -309,10 +373,10 @@ private:
         size_t const compressed_bound = ZSTD_compressBound(frame_buffer.size());
         std::vector<u8> compressed_buffer(compressed_bound);
         
-        size_t compressed_size = ZSTD_compressCCtx(cctx, 
+        size_t compressed_size = ZSTD_compressCCtx(cctx,
             compressed_buffer.data(), compressed_buffer.size(),
             frame_buffer.data(), frame_buffer.size(),
-            3); // Compression level 3
+            compression_level);
             
         if (ZSTD_isError(compressed_size)) {
             std::cerr << "Compression error: " << ZSTD_getErrorName(compressed_size) << std::endl;
@@ -400,7 +464,9 @@ private:
 bool CompressZ3DSFile(const std::string& src_file, const std::string& dst_file,
                       const std::array<u8, 4>& underlying_magic, size_t frame_size,
                       ProgressCallback update_callback,
-                      const std::unordered_map<std::string, std::vector<u8>>& metadata) {
+                      const std::unordered_map<std::string, std::vector<u8>>& metadata,
+                      int compression_level, unsigned int worker_count,
+                      size_t read_chunk_size) {
     
     // Open source file
     std::ifstream input(src_file, std::ios::binary);
@@ -453,15 +519,15 @@ bool CompressZ3DSFile(const std::string& src_file, const std::string& dst_file,
     output.write(reinterpret_cast<const char*>(pad.data()), padding);
     
     // Start compression with proper seekable ZSTD format
-    SeekableZSTDCompressor compressor(output, frame_size, true);
-    
+    SeekableZSTDCompressor compressor(output, frame_size, true, compression_level, worker_count);
+
     // Compress file in chunks
-    constexpr size_t BUFFER_SIZE = 64 * 1024; // 64KB buffer
-    std::vector<u8> buffer(BUFFER_SIZE);
+    const size_t buffer_size = std::max<size_t>(read_chunk_size, 64 * 1024);
+    std::vector<u8> buffer(buffer_size);
     size_t processed = 0;
     
     while (input.good() && processed < uncompressed_size) {
-        size_t to_read = std::min(BUFFER_SIZE, static_cast<size_t>(uncompressed_size - processed));
+        size_t to_read = std::min(buffer_size, static_cast<size_t>(uncompressed_size - processed));
         input.read(reinterpret_cast<char*>(buffer.data()), to_read);
         size_t read_size = input.gcount();
         
@@ -540,5 +606,162 @@ bool CompressZ3DSFile(const std::string& src_file, const std::string& dst_file,
     
     std::cout << "\nCreated " << compressor.GetFrameCount() << " seekable frames" << std::endl;
     
+    return true;
+}
+
+bool DecompressZ3DSFile(const std::string& src_file, const std::string& dst_file,
+                        ProgressCallback update_callback, size_t read_chunk_size) {
+    std::ifstream input(src_file, std::ios::binary);
+    if (!input.is_open()) {
+        std::cerr << "Error: Could not open compressed source file: " << src_file << std::endl;
+        return false;
+    }
+
+    Z3DSFileHeader header;
+    if (!ReadHeader(input, header)) {
+        std::cerr << "Error: Failed to read Z3DS header" << std::endl;
+        return false;
+    }
+
+    if (header.magic != Z3DSFileHeader::EXPECTED_MAGIC) {
+        std::cerr << "Error: Invalid Z3DS magic" << std::endl;
+        return false;
+    }
+
+    if (header.version != Z3DSFileHeader::EXPECTED_VERSION) {
+        std::cerr << "Error: Unsupported Z3DS version" << std::endl;
+        return false;
+    }
+
+    std::ofstream output(dst_file, std::ios::binary);
+    if (!output.is_open()) {
+        std::cerr << "Error: Could not create destination file: " << dst_file << std::endl;
+        return false;
+    }
+
+    // Skip header and metadata to reach data start.
+    std::streamoff data_start = static_cast<std::streamoff>(header.header_size) +
+                               static_cast<std::streamoff>(header.metadata_size);
+    input.seekg(data_start, std::ios::beg);
+
+    input.seekg(0, std::ios::end);
+    std::streamoff file_size = input.tellg();
+    if (data_start + static_cast<std::streamoff>(header.compressed_size) > file_size) {
+        std::cerr << "Error: Truncated Z3DS file" << std::endl;
+        return false;
+    }
+
+    // Parse seekable footer to locate skippable frame size.
+    std::streamoff footer_pos = data_start + static_cast<std::streamoff>(header.compressed_size) - 9;
+    input.seekg(footer_pos, std::ios::beg);
+
+    auto read_u32 = [&]() -> std::optional<u32> {
+        u8 buf[4];
+        input.read(reinterpret_cast<char*>(buf), 4);
+        if (input.gcount() != 4) {
+            return std::nullopt;
+        }
+        return ReadLE32(buf);
+    };
+
+    auto num_frames_opt = read_u32();
+    if (!num_frames_opt) {
+        std::cerr << "Error: Failed to read frame count from seek table" << std::endl;
+        return false;
+    }
+    u32 num_frames = *num_frames_opt;
+    u8 descriptor = 0;
+    input.read(reinterpret_cast<char*>(&descriptor), 1);
+    auto seekable_magic_opt = read_u32();
+    if (!seekable_magic_opt) {
+        std::cerr << "Error: Failed to read seek table magic" << std::endl;
+        return false;
+    }
+    u32 seekable_magic = *seekable_magic_opt;
+
+    if (seekable_magic != 0x8F92EAB1) {
+        std::cerr << "Error: Invalid seek table magic" << std::endl;
+        return false;
+    }
+
+    size_t entry_size = (descriptor & 0x80) ? 12 : 8;
+    size_t table_size = static_cast<size_t>(num_frames) * entry_size + 9;
+    size_t skippable_total = 8 + table_size;
+
+    if (header.compressed_size < skippable_total) {
+        std::cerr << "Error: Invalid compressed size in header" << std::endl;
+        return false;
+    }
+
+    size_t payload_size = static_cast<size_t>(header.compressed_size - skippable_total);
+
+    input.seekg(data_start, std::ios::beg);
+
+    ZSTD_DCtx* dctx = ZSTD_createDCtx();
+    if (!dctx) {
+        std::cerr << "Error: Unable to allocate ZSTD decompression context" << std::endl;
+        return false;
+    }
+
+    const size_t in_buffer_size = std::max<size_t>(read_chunk_size, 64 * 1024);
+    std::vector<u8> in_buffer(in_buffer_size);
+    std::vector<u8> out_buffer(1 * 1024 * 1024);
+
+    size_t remaining = payload_size;
+    size_t written = 0;
+
+    while (remaining > 0) {
+        size_t to_read = std::min(in_buffer_size, remaining);
+        input.read(reinterpret_cast<char*>(in_buffer.data()), to_read);
+        size_t read_size = input.gcount();
+        if (read_size == 0) {
+            break;
+        }
+
+        remaining -= read_size;
+
+        ZSTD_inBuffer in{in_buffer.data(), read_size, 0};
+        while (in.pos < in.size) {
+            ZSTD_outBuffer out{out_buffer.data(), out_buffer.size(), 0};
+            size_t ret = ZSTD_decompressStream(dctx, &out, &in);
+            if (ZSTD_isError(ret)) {
+                std::cerr << "Decompression error: " << ZSTD_getErrorName(ret) << std::endl;
+                ZSTD_freeDCtx(dctx);
+                return false;
+            }
+            if (out.pos > 0) {
+                output.write(reinterpret_cast<const char*>(out_buffer.data()), out.pos);
+                written += out.pos;
+                if (update_callback) {
+                    update_callback(written, static_cast<size_t>(header.uncompressed_size));
+                }
+            }
+        }
+    }
+
+    ZSTD_outBuffer out{out_buffer.data(), out_buffer.size(), 0};
+    ZSTD_inBuffer empty_in{nullptr, 0, 0};
+    size_t ret = 0;
+    do {
+        out.pos = 0;
+        ret = ZSTD_decompressStream(dctx, &out, &empty_in);
+        if (ZSTD_isError(ret)) {
+            std::cerr << "Decompression error while flushing: " << ZSTD_getErrorName(ret) << std::endl;
+            ZSTD_freeDCtx(dctx);
+            return false;
+        }
+        if (out.pos > 0) {
+            output.write(reinterpret_cast<const char*>(out_buffer.data()), out.pos);
+            written += out.pos;
+        }
+    } while (ret != 0);
+
+    ZSTD_freeDCtx(dctx);
+
+    if (written != header.uncompressed_size) {
+        std::cerr << "Warning: Decompressed size mismatch (expected " << header.uncompressed_size
+                  << ", got " << written << ")" << std::endl;
+    }
+
     return true;
 }
